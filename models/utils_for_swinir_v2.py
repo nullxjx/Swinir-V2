@@ -94,20 +94,6 @@ def fold(input: torch.Tensor,
     output: torch.Tensor = output.permute(0, 3, 1, 4, 2, 5).reshape(batch_size, channels, height, width)
     return output
 
-def window_partition(x, window_size):
-    """
-    Args:
-        x: (B, H, W, C)
-        window_size (int): window size
-
-    Returns:
-        windows: (num_windows*B, window_size, window_size, C)
-    """
-    B, H, W, C = x.shape
-    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
-    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
-    return windows
-
 
 class WindowMultiHeadAttention(nn.Module):
     """
@@ -155,16 +141,16 @@ class WindowMultiHeadAttention(nn.Module):
             nn.Linear(in_features=2, out_features=meta_network_hidden_features, bias=True),
             nn.ReLU(inplace=True),
             nn.Linear(in_features=meta_network_hidden_features, out_features=number_of_heads, bias=True))
-        # Init pair-wise relative positions (log-spaced)
-        self.__make_pair_wise_relative_positions()
         # Init tau
         self.register_parameter("tau", torch.nn.Parameter(torch.ones(1, number_of_heads, 1, 1)))
+        # Init pair-wise relative positions (log-spaced)
+        self.__make_pair_wise_relative_positions()
 
     def __make_pair_wise_relative_positions(self) -> None:
         """
         Method initializes the pair-wise relative positions to compute the positional biases
         """
-        indexes: torch.Tensor = torch.arange(self.window_size)
+        indexes: torch.Tensor = torch.arange(self.window_size, device=self.tau.device)
         coordinates: torch.Tensor = torch.stack(torch.meshgrid([indexes, indexes]), dim=0)
         coordinates: torch.Tensor = torch.flatten(coordinates, start_dim=1)
         relative_coordinates: torch.Tensor = coordinates[:, :, None] - coordinates[:, None, :]
@@ -216,8 +202,6 @@ class WindowMultiHeadAttention(nn.Module):
         :return: (torch.Tensor) Output feature map of the shape [batch size * windows, tokens, channels]
         """
         # Compute attention map with scaled cosine attention
-
-        # print("swin v2 scaled cosine attention")
         attention_map: torch.Tensor = torch.einsum("bhqd, bhkd -> bhqk", query, key) \
                                       / torch.maximum(torch.norm(query, dim=-1, keepdim=True)
                                                       * torch.norm(key, dim=-1, keepdim=True).transpose(-2, -1),
@@ -397,7 +381,7 @@ class SwinTransformerBlock(nn.Module):
         # Make masks for shift case
         if self.shift_size > 0:
             height, width = self.input_resolution  # type: int, int
-            mask: torch.Tensor = torch.zeros(height, width)
+            mask: torch.Tensor = torch.zeros(height, width, device=self.window_attention.tau.device)
             height_slices: Tuple = (slice(0, -self.window_size),
                                     slice(-self.window_size, -self.shift_size),
                                     slice(-self.shift_size, None))
@@ -443,29 +427,6 @@ class SwinTransformerBlock(nn.Module):
         # Update attention module
         self.window_attention.update_resolution(new_window_size=new_window_size)
 
-    def calculate_mask(self, x_size):
-        # calculate attention mask for SW-MSA
-        H, W = x_size
-        img_mask = torch.zeros((1, H, W, 1))  # 1 H W 1
-        h_slices = (slice(0, -self.window_size),
-                    slice(-self.window_size, -self.shift_size),
-                    slice(-self.shift_size, None))
-        w_slices = (slice(0, -self.window_size),
-                    slice(-self.window_size, -self.shift_size),
-                    slice(-self.shift_size, None))
-        cnt = 0
-        for h in h_slices:
-            for w in w_slices:
-                img_mask[:, h, w, :] = cnt
-                cnt += 1
-
-        mask_windows = window_partition(img_mask, self.window_size)  # nW, window_size, window_size, 1
-        mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
-        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
-        attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
-
-        return attn_mask
-
     def forward(self,
                 input: torch.Tensor) -> torch.Tensor:
         """
@@ -484,14 +445,8 @@ class SwinTransformerBlock(nn.Module):
         # Make patches
         output_patches: torch.Tensor = unfold(input=output_shift, window_size=self.window_size) \
             if self.make_windows else output_shift
-
         # Perform window attention
-        x_size = (height, width)
-        if self.input_resolution == x_size:
-            output_attention: torch.Tensor = self.window_attention(output_patches, mask=self.attention_mask)
-        else:
-            output_attention: torch.Tensor = self.window_attention(output_patches, mask=self.calculate_mask(x_size).to(input.device))
-
+        output_attention: torch.Tensor = self.window_attention(output_patches, mask=self.attention_mask)
         # Merge patches
         output_merge: torch.Tensor = fold(input=output_attention, window_size=self.window_size, height=height,
                                           width=width) if self.make_windows else output_attention
@@ -578,8 +533,10 @@ class DeformableSwinTransformerBlock(SwinTransformerBlock):
         Method generates the default sampling grid (inspired by kornia)
         """
         # Init x and y coordinates
-        x: torch.Tensor = torch.linspace(0, self.input_resolution[1] - 1, self.input_resolution[1])
-        y: torch.Tensor = torch.linspace(0, self.input_resolution[0] - 1, self.input_resolution[0])
+        x: torch.Tensor = torch.linspace(0, self.input_resolution[1] - 1, self.input_resolution[1],
+                                         device=self.tau.device)
+        y: torch.Tensor = torch.linspace(0, self.input_resolution[0] - 1, self.input_resolution[0],
+                                         device=self.tau.device)
         # Normalize coordinates to a range of [-1, 1]
         x: torch.Tensor = (x / (self.input_resolution[1] - 1) - 0.5) * 2
         y: torch.Tensor = (y / (self.input_resolution[0] - 1) - 0.5) * 2
@@ -614,7 +571,10 @@ class DeformableSwinTransformerBlock(SwinTransformerBlock):
         # Reshape offsets to [batch size, number of heads, height, width, 2]
         offsets: torch.Tensor = offsets.reshape(batch_size, -1, 2, height, width).permute(0, 1, 3, 4, 2)
         # Flatten batch size and number of heads and apply tanh
-        offsets: torch.Tensor = offsets.reshape(-1, height, width, 2).tanh()
+        offsets: torch.Tensor = offsets.view(-1, height, width, 2).tanh()
+        # Cast offset grid to input data type
+        if input.dtype != self.default_grid.dtype:
+            self.default_grid = self.default_grid.type(input.dtype)
         # Construct offset grid
         offset_grid: torch.Tensor = self.default_grid.repeat_interleave(repeats=offsets.shape[0], dim=0) + offsets
         # Reshape input to [batch size * number of heads, channels / number of heads, height, width]
