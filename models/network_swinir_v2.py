@@ -9,7 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
-from utils_for_swinir_v2 import *
+from .utils_for_swinir_v2 import *
+
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
@@ -242,6 +243,7 @@ class BasicLayer(nn.Module):
         self.input_resolution = input_resolution
         self.depth = depth
         self.use_checkpoint = use_checkpoint
+        self.window_size = window_size
 
         # build blocks
         Block = DeformableSwinTransformerBlock if use_deformable_block else SwinTransformerBlock
@@ -264,6 +266,10 @@ class BasicLayer(nn.Module):
             self.downsample = downsample(input_resolution, dim=dim, norm_layer=norm_layer)
         else:
             self.downsample = None
+
+    def update_resolution(self, window_size, size):
+        for block in self.blocks:
+            block.update_resolution(window_size, size)
 
     def forward(self, x, x_size):
         B, N, C = x.shape
@@ -358,6 +364,9 @@ class RSTB(nn.Module):
         self.patch_unembed = PatchUnEmbed(
             img_size=img_size, patch_size=patch_size, in_chans=0, embed_dim=dim,
             norm_layer=None)
+
+    def update_resolution(self, window_size, size):
+        self.residual_group.update_resolution(window_size, size)
 
     def forward(self, x, x_size):
         return self.patch_embed(self.conv(self.patch_unembed(self.residual_group(x, x_size), x_size))) + x
@@ -546,7 +555,11 @@ class SwinIR(nn.Module):
         self.upsampler = upsampler
         self.window_size = window_size
 
-        print("swinir v2 2022.2.5!!!!, defor: {}".format(use_deformable_block))
+        self.img_size = img_size
+        if not isinstance(self.img_size, tuple):
+            self.img_size = to_2tuple(img_size)
+
+        print("swinir v2 2022.2.9!!!!, defor: {}".format(use_deformable_block))
 
         #####################################################################################################
         ################################### 1, shallow feature extraction ###################################
@@ -648,6 +661,10 @@ class SwinIR(nn.Module):
 
         self.apply(self._init_weights)
 
+    def update_resolution(self, window_size, size):
+        for layer in self.layers:
+            layer.update_resolution(window_size, size)
+
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=.02)
@@ -691,6 +708,10 @@ class SwinIR(nn.Module):
         H, W = x.shape[2:]
         x = self.check_image_size(x)
 
+        x_size = x.shape[2:]
+        if x_size != self.img_size:
+            self.update_resolution(self.window_size, x_size)
+
         self.mean = self.mean.type_as(x)
         x = (x - self.mean) * self.img_range
 
@@ -719,6 +740,9 @@ class SwinIR(nn.Module):
             res = self.conv_after_body(self.forward_features(x_first)) + x_first
             x = x + self.conv_last(res)
 
+        if x_size != self.img_size:
+            self.update_resolution(self.window_size, self.img_size)
+
         x = x / self.img_range + self.mean
 
         return x[:, :, :H * self.upscale, :W * self.upscale]
@@ -736,11 +760,11 @@ class SwinIR(nn.Module):
 
 
 if __name__ == '__main__':
-    model = SwinIR(upscale=2, img_size=(48, 48), window_size=8, img_range=1., depths=[2,2,2,2],
+    model = SwinIR(upscale=2, img_size=(48, 48), window_size=8, img_range=1., depths=[2, 2, 2, 2],
                    embed_dim=24, num_heads=[6, 6, 6, 6], mlp_ratio=2, upsampler='pixelshuffledirect',
-                   use_deformable_block=True).cuda(0)
+                   use_deformable_block=False).cuda(0)
 
-    x = torch.randn((1, 3, 240, 250)).cuda(0)
+    x = torch.randn((1, 3, 66, 113)).cuda(0)
     print(x.shape)
     # from torchsummaryX import summary
     # summary(model, x)
